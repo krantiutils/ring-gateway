@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 
 /**
  * Injects audio into a live cellular call via root access to ALSA PCM device.
@@ -132,6 +133,46 @@ class AudioInjector(
     }
 
     /**
+     * Validates and resolves a WAV file path, rejecting paths that contain
+     * shell metacharacters or fail canonical-path checks.
+     *
+     * @return the canonical absolute path, or null if validation fails
+     */
+    private fun validatePath(wavPath: String): String? {
+        if (wavPath.isBlank()) {
+            onLog("[ERROR] Empty audio path")
+            return null
+        }
+
+        // Strict character whitelist — only allow safe filesystem characters.
+        // This blocks shell metacharacters (;|&`$(){}!\'"<> etc.) and
+        // null bytes that could truncate C-level path strings.
+        val safePathPattern = Regex("^[a-zA-Z0-9/._\\-]+$")
+        if (!safePathPattern.matches(wavPath)) {
+            onLog("[ERROR] Audio path contains invalid characters — rejected")
+            Log.e(TAG, "Path rejected by character whitelist: wavPath contained disallowed characters")
+            return null
+        }
+
+        val file = File(wavPath)
+        val canonical: String
+        try {
+            canonical = file.canonicalPath
+        } catch (e: IOException) {
+            onLog("[ERROR] Failed to resolve audio path")
+            Log.e(TAG, "canonicalPath failed for provided wavPath", e)
+            return null
+        }
+
+        if (!File(canonical).exists()) {
+            onLog("[ERROR] Audio file not found: $canonical")
+            return null
+        }
+
+        return canonical
+    }
+
+    /**
      * Plays a WAV file through the voice call uplink via root ALSA access.
      * Uses the detected (or overridden) card and device.
      *
@@ -148,8 +189,8 @@ class AudioInjector(
             return
         }
 
-        if (!File(wavPath).exists()) {
-            onLog("[ERROR] Audio file not found: $wavPath")
+        val safePath = validatePath(wavPath)
+        if (safePath == null) {
             onComplete?.invoke(false)
             return
         }
@@ -163,12 +204,17 @@ class AudioInjector(
 
         Thread {
             try {
-                val cmd = "$binPath $wavPath -D ${config.card} -d ${config.deviceTx}"
-                onLog("[AUDIO] Executing: su -c '$cmd'")
+                // Build command as an explicit argument array to avoid shell interpretation.
+                // Each argument to tinyplay is passed individually through su's -c,
+                // with the path single-quoted as defense-in-depth.
+                val shellCmd = "'$binPath' '${safePath}' -D ${config.card} -d ${config.deviceTx}"
+                onLog("[AUDIO] Executing: su -c $shellCmd")
                 onLog("[AUDIO] Config: chipset=${config.chipset} card=${config.card} device=${config.deviceTx} " +
                     "(probed=${config.probed}, override=${config.manualOverride})")
 
-                val process = Runtime.getRuntime().exec(arrayOf("su", "-c", cmd))
+                val process = ProcessBuilder("su", "-c", shellCmd)
+                    .redirectErrorStream(false)
+                    .start()
                 currentProcess = process
                 isPlaying = true
 

@@ -258,6 +258,15 @@ class GatewayService : Service(), RingInCallService.CallControlListener {
             return
         }
 
+        // Defense-in-depth: reject paths with shell metacharacters at the entry point,
+        // before they reach AudioInjector. AudioInjector also validates independently.
+        val safePathPattern = Regex("^[a-zA-Z0-9/._\\-]+$")
+        if (audioPath.isNotBlank() && !safePathPattern.matches(audioPath)) {
+            log("[SECURITY] Rejected audioPath with invalid characters")
+            sendResponse(id, "INVALID_PATH", false, "Audio path contains invalid characters")
+            return
+        }
+
         updateStatus(GatewayStatus.PLAYING_AUDIO, "Playing audio")
 
         val wavPath: String = when {
