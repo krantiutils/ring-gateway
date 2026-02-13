@@ -9,6 +9,9 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.ANSWER_PHONE_CALLS" />
+    <uses-permission android:name="android.permission.MANAGE_OWN_CALLS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
 
     <application
         android:allowBackup="false"
@@ -17,6 +20,7 @@
         android:usesCleartextTraffic="true"
         android:theme="@style/Theme.MaterialComponents.DayNight.DarkActionBar">
 
+        <!-- Main activity — also handles DIAL intents for default dialer eligibility -->
         <activity
             android:name=".MainActivity"
             android:exported="true">
@@ -24,12 +28,44 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.DIAL" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.DIAL" />
+                <data android:scheme="tel" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
         </activity>
+
+        <!-- Minimal in-call UI — required for ROLE_DIALER -->
+        <activity
+            android:name=".InCallActivity"
+            android:exported="false"
+            android:showOnLockScreen="true"
+            android:turnScreenOn="true"
+            android:taskAffinity="com.ringai.gateway.incall"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar" />
 
         <service
             android:name=".GatewayService"
             android:foregroundServiceType="phoneCall"
             android:exported="false" />
+
+        <!-- InCallService — receives Call objects from the system when app is default dialer -->
+        <service
+            android:name=".RingInCallService"
+            android:permission="android.permission.BIND_INCALL_SERVICE"
+            android:exported="true">
+            <meta-data
+                android:name="android.telecom.IN_CALL_SERVICE_UI"
+                android:value="true" />
+            <intent-filter>
+                <action android:name="android.telecom.InCallService" />
+            </intent-filter>
+        </service>
 
     </application>
 

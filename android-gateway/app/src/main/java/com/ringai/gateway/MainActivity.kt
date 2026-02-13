@@ -1,16 +1,21 @@
 package com.ringai.gateway
 
 import android.Manifest
+import android.app.role.RoleManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.telecom.TelecomManager
 import android.widget.Button
 import android.widget.ScrollView
 import android.widget.TextView
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -29,7 +34,8 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.CALL_PHONE,
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.SEND_SMS
+            Manifest.permission.SEND_SMS,
+            Manifest.permission.ANSWER_PHONE_CALLS
         )
     }
 
@@ -53,6 +59,8 @@ class MainActivity : AppCompatActivity() {
     private var inCall = false
     private var dialInitiated = false
     private var hasBeenOffhook = false
+
+    private lateinit var defaultDialerLauncher: ActivityResultLauncher<Intent>
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
@@ -79,6 +87,17 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        defaultDialerLauncher = registerForActivityResult(
+            ActivityResultContracts.StartActivityForResult()
+        ) { result ->
+            if (isDefaultDialer()) {
+                log("[DIALER] App is now the default dialer — InCallService active")
+            } else {
+                log("[DIALER] Default dialer request declined — call control will not work")
+            }
+        }
+
         setContentView(R.layout.activity_main)
 
         serverUrlInput = findViewById(R.id.serverUrlInput)
@@ -108,6 +127,7 @@ class MainActivity : AppCompatActivity() {
         clearLogButton.setOnClickListener { logView.text = "Ready.\n" }
 
         requestPermissionsIfNeeded()
+        requestDefaultDialerIfNeeded()
     }
 
     override fun onStart() {
@@ -288,6 +308,35 @@ class MainActivity : AppCompatActivity() {
         } else {
             log("[PERM] All permissions granted")
         }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun requestDefaultDialerIfNeeded() {
+        if (isDefaultDialer()) {
+            log("[DIALER] Already default dialer")
+            return
+        }
+
+        log("[DIALER] Requesting default dialer role (required for call control)")
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val roleManager = getSystemService(RoleManager::class.java)
+            if (roleManager.isRoleAvailable(RoleManager.ROLE_DIALER)
+                && !roleManager.isRoleHeld(RoleManager.ROLE_DIALER)) {
+                val intent = roleManager.createRequestRoleIntent(RoleManager.ROLE_DIALER)
+                defaultDialerLauncher.launch(intent)
+            }
+        } else {
+            val intent = Intent(TelecomManager.ACTION_CHANGE_DEFAULT_DIALER).apply {
+                putExtra(TelecomManager.EXTRA_CHANGE_DEFAULT_DIALER_PACKAGE_NAME, packageName)
+            }
+            defaultDialerLauncher.launch(intent)
+        }
+    }
+
+    private fun isDefaultDialer(): Boolean {
+        val telecomManager = getSystemService(TelecomManager::class.java)
+        return telecomManager.defaultDialerPackage == packageName
     }
 
     override fun onRequestPermissionsResult(

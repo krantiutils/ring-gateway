@@ -9,6 +9,8 @@ import android.content.Context
 import android.content.Intent
 import android.os.Binder
 import android.os.IBinder
+import android.telecom.Call
+import android.telecom.DisconnectCause
 import android.telephony.SmsManager
 import android.util.Log
 import okhttp3.OkHttpClient
@@ -22,7 +24,7 @@ import java.io.FileOutputStream
 import java.net.URL
 import java.util.concurrent.TimeUnit
 
-class GatewayService : Service() {
+class GatewayService : Service(), RingInCallService.CallControlListener {
 
     companion object {
         private const val TAG = "GatewayService"
@@ -70,6 +72,7 @@ class GatewayService : Service() {
         audioInjector = AudioInjector(this) { msg -> log(msg) }
         audioInjector.ensureTinyplay()
         callManager.startListening()
+        RingInCallService.addListener(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -97,6 +100,7 @@ class GatewayService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
+        RingInCallService.removeListener(this)
         disconnect()
         callManager.stopListening()
         audioInjector.stop()
@@ -199,6 +203,19 @@ class GatewayService : Service() {
                 "HANGUP" -> {
                     handleHangup(id)
                 }
+                "HOLD" -> {
+                    handleHold(id)
+                }
+                "UNHOLD" -> {
+                    handleUnhold(id)
+                }
+                "ANSWER" -> {
+                    handleAnswer(id)
+                }
+                "SEND_DTMF" -> {
+                    val digits = json.getString("digits")
+                    handleSendDtmf(id, digits)
+                }
                 "SEND_SMS" -> {
                     val number = json.getString("number")
                     val message = json.getString("message")
@@ -276,12 +293,79 @@ class GatewayService : Service() {
 
     private fun handleHangup(id: String) {
         audioInjector.stop()
-        // Programmatic hangup not possible without InCallService.
-        // Log and notify — the call will end when the other party hangs up,
-        // or the server can instruct the user.
-        log("[CALL] Hangup requested — audio stopped, call must end from dialer")
-        sendResponse(id, "HANGUP_REQUESTED", true,
-            "Audio stopped. Programmatic hangup requires InCallService registration.")
+        val durationMs = RingInCallService.getCallDurationMs()
+        val success = RingInCallService.hangup()
+        if (success) {
+            log("[CALL] Hangup — disconnecting call (duration=${durationMs}ms)")
+            sendCallControlResponse(id, "HUNGUP", true, durationMs = durationMs)
+        } else {
+            log("[CALL] Hangup requested — no active InCallService call, audio stopped")
+            sendCallControlResponse(id, "HANGUP_NO_CALL", false,
+                message = "No active call via InCallService. Is the app set as default dialer?")
+        }
+    }
+
+    private fun handleHold(id: String) {
+        val success = RingInCallService.hold()
+        if (success) {
+            log("[CALL] Putting call on hold")
+            sendCallControlResponse(id, "HELD", true,
+                durationMs = RingInCallService.getCallDurationMs())
+        } else {
+            val callState = RingInCallService.getCallStateString()
+            log("[CALL] Hold failed — state=$callState")
+            sendCallControlResponse(id, "HOLD_FAILED", false,
+                message = "Cannot hold. Call state: $callState")
+        }
+    }
+
+    private fun handleUnhold(id: String) {
+        val success = RingInCallService.unhold()
+        if (success) {
+            log("[CALL] Resuming call from hold")
+            sendCallControlResponse(id, "UNHELD", true,
+                durationMs = RingInCallService.getCallDurationMs())
+        } else {
+            val callState = RingInCallService.getCallStateString()
+            log("[CALL] Unhold failed — state=$callState")
+            sendCallControlResponse(id, "UNHOLD_FAILED", false,
+                message = "Cannot unhold. Call state: $callState")
+        }
+    }
+
+    private fun handleAnswer(id: String) {
+        val success = RingInCallService.answer()
+        if (success) {
+            log("[CALL] Answering incoming call")
+            sendCallControlResponse(id, "ANSWERED", true)
+        } else {
+            val callState = RingInCallService.getCallStateString()
+            log("[CALL] Answer failed — no ringing call (state=$callState)")
+            sendCallControlResponse(id, "ANSWER_FAILED", false,
+                message = "No ringing call to answer. Call state: $callState")
+        }
+    }
+
+    private fun handleSendDtmf(id: String, digits: String) {
+        if (digits.isEmpty()) {
+            sendCallControlResponse(id, "DTMF_FAILED", false, message = "No digits provided")
+            return
+        }
+        val success = if (digits.length == 1) {
+            RingInCallService.sendDtmf(digits[0])
+        } else {
+            RingInCallService.sendDtmfSequence(digits)
+        }
+        if (success) {
+            log("[CALL] Sending DTMF: $digits")
+            sendCallControlResponse(id, "DTMF_SENT", true,
+                durationMs = RingInCallService.getCallDurationMs())
+        } else {
+            val callState = RingInCallService.getCallStateString()
+            log("[CALL] DTMF failed — state=$callState")
+            sendCallControlResponse(id, "DTMF_FAILED", false,
+                message = "Cannot send DTMF. Call state: $callState")
+        }
     }
 
     @Suppress("DEPRECATION")
@@ -358,13 +442,85 @@ class GatewayService : Service() {
         webSocket?.send(json.toString())
     }
 
-    private fun sendEvent(event: String) {
+    private fun sendCallControlResponse(
+        id: String,
+        type: String,
+        success: Boolean,
+        message: String? = null,
+        durationMs: Long? = null,
+        disconnectCause: String? = null
+    ) {
+        val json = JSONObject().apply {
+            put("type", "response")
+            put("id", id)
+            put("result", type)
+            put("success", success)
+            put("callState", RingInCallService.getCallStateString())
+            message?.let { put("message", it) }
+            durationMs?.let { put("callDurationMs", it) }
+            disconnectCause?.let { put("disconnectCause", it) }
+        }
+        webSocket?.send(json.toString())
+    }
+
+    private fun sendEvent(event: String, extras: (JSONObject.() -> Unit)? = null) {
         val json = JSONObject().apply {
             put("type", "event")
             put("event", event)
             put("status", status.name)
+            put("callState", RingInCallService.getCallStateString())
+            extras?.invoke(this)
         }
         webSocket?.send(json.toString())
+    }
+
+    // -- RingInCallService.CallControlListener --
+
+    override fun onCallAdded(call: Call) {
+        val handle = call.details.handle
+        val number = handle?.schemeSpecificPart ?: "unknown"
+        val isIncoming = call.state == Call.STATE_RINGING
+        log("[INCALL] Call added: $number (${if (isIncoming) "incoming" else "outgoing"})")
+
+        if (isIncoming) {
+            sendEvent("INCOMING_CALL") {
+                put("number", number)
+            }
+        }
+    }
+
+    override fun onCallRemoved(call: Call, disconnectCause: DisconnectCause?) {
+        val causeCode = disconnectCause?.code ?: DisconnectCause.UNKNOWN
+        val causeLabel = disconnectCause?.label?.toString() ?: "unknown"
+        val causeReason = disconnectCause?.reason ?: ""
+        val durationMs = RingInCallService.getCallDurationMs()
+
+        log("[INCALL] Call removed: cause=$causeLabel reason=$causeReason")
+
+        sendEvent("CALL_ENDED") {
+            put("disconnectCauseCode", causeCode)
+            put("disconnectCause", causeLabel)
+            put("disconnectReason", causeReason)
+            put("callDurationMs", durationMs)
+        }
+    }
+
+    override fun onCallStateChanged(call: Call, state: Int) {
+        val stateStr = when (state) {
+            Call.STATE_ACTIVE -> "ACTIVE"
+            Call.STATE_HOLDING -> "HOLDING"
+            Call.STATE_DIALING -> "DIALING"
+            Call.STATE_RINGING -> "RINGING"
+            Call.STATE_CONNECTING -> "CONNECTING"
+            Call.STATE_DISCONNECTING -> "DISCONNECTING"
+            Call.STATE_DISCONNECTED -> "DISCONNECTED"
+            else -> "UNKNOWN($state)"
+        }
+        log("[INCALL] Call state: $stateStr")
+        sendEvent("CALL_STATE_CHANGED") {
+            put("callState", stateStr)
+            put("callDurationMs", RingInCallService.getCallDurationMs())
+        }
     }
 
     private fun sendStatus() {
@@ -372,6 +528,9 @@ class GatewayService : Service() {
             put("type", "heartbeat")
             put("status", status.name)
             put("audioPlaying", audioInjector.isPlaying)
+            put("callState", RingInCallService.getCallStateString())
+            put("callDurationMs", RingInCallService.getCallDurationMs())
+            put("activeCalls", RingInCallService.calls.size)
         }
         webSocket?.send(json.toString())
     }
