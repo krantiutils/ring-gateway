@@ -71,6 +71,7 @@ class GatewayService : Service(), RingInCallService.CallControlListener {
         callManager = CallManager(this) { state -> onCallStateChanged(state) }
         audioInjector = AudioInjector(this) { msg -> log(msg) }
         audioInjector.ensureTinyplay()
+        audioInjector.initDeviceConfig()
         callManager.startListening()
         RingInCallService.addListener(this)
     }
@@ -223,6 +224,12 @@ class GatewayService : Service(), RingInCallService.CallControlListener {
                 }
                 "PING" -> {
                     sendResponse(id, "PONG", true)
+                }
+                "GET_CHIPSET" -> {
+                    handleGetChipset(id)
+                }
+                "SET_AUDIO_DEVICE" -> {
+                    handleSetAudioDevice(id, json)
                 }
                 else -> {
                     log("[CMD] Unknown command: $command")
@@ -386,6 +393,35 @@ class GatewayService : Service(), RingInCallService.CallControlListener {
         }
     }
 
+    private fun handleGetChipset(id: String) {
+        val config = audioInjector.getDeviceConfig()
+        val json = JSONObject().apply {
+            put("type", "response")
+            put("id", id)
+            put("result", "CHIPSET_INFO")
+            put("success", true)
+            put("config", config.toJson())
+        }
+        webSocket?.send(json.toString())
+        log("[CMD] GET_CHIPSET → ${config.chipset} card=${config.card} tx=${config.deviceTx} rx=${config.deviceRx}")
+    }
+
+    private fun handleSetAudioDevice(id: String, json: JSONObject) {
+        try {
+            val card = json.getInt("card")
+            val deviceTx = json.getInt("device_tx")
+            val deviceRx = json.optInt("device_rx", -1)
+
+            audioInjector.setManualOverride(card, deviceTx, deviceRx)
+            sendResponse(id, "AUDIO_DEVICE_SET", true,
+                "Manual override: card=$card tx=$deviceTx rx=$deviceRx")
+        } catch (e: Exception) {
+            log("[ERROR] SET_AUDIO_DEVICE failed: ${e.message}")
+            sendResponse(id, "INVALID_PARAMS", false,
+                "Required: card (int), device_tx (int). Optional: device_rx (int). Error: ${e.message}")
+        }
+    }
+
     private fun downloadAudio(url: String): String? {
         return try {
             log("[AUDIO] Downloading from $url")
@@ -530,6 +566,7 @@ class GatewayService : Service(), RingInCallService.CallControlListener {
             put("callState", RingInCallService.getCallStateString())
             put("callDurationMs", RingInCallService.getCallDurationMs())
             put("activeCalls", RingInCallService.calls.size)
+            put("chipset", ChipsetDetector.detect().name)
         }
         webSocket?.send(json.toString())
     }
