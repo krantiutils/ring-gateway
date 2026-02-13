@@ -489,13 +489,12 @@ class GatewayService : Service(), RingInCallService.CallControlListener {
         }
     }
 
-    override fun onCallRemoved(call: Call, disconnectCause: DisconnectCause?) {
+    override fun onCallRemoved(call: Call, disconnectCause: DisconnectCause?, durationMs: Long) {
         val causeCode = disconnectCause?.code ?: DisconnectCause.UNKNOWN
         val causeLabel = disconnectCause?.label?.toString() ?: "unknown"
         val causeReason = disconnectCause?.reason ?: ""
-        val durationMs = RingInCallService.getCallDurationMs()
 
-        log("[INCALL] Call removed: cause=$causeLabel reason=$causeReason")
+        log("[INCALL] Call removed: cause=$causeLabel reason=$causeReason duration=${durationMs}ms")
 
         sendEvent("CALL_ENDED") {
             put("disconnectCauseCode", causeCode)

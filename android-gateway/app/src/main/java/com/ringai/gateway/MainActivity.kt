@@ -35,7 +35,8 @@ class MainActivity : AppCompatActivity() {
             Manifest.permission.READ_PHONE_STATE,
             Manifest.permission.RECORD_AUDIO,
             Manifest.permission.SEND_SMS,
-            Manifest.permission.ANSWER_PHONE_CALLS
+            Manifest.permission.ANSWER_PHONE_CALLS,
+            Manifest.permission.POST_NOTIFICATIONS
         )
     }
 

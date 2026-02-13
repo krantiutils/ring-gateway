@@ -9,9 +9,11 @@ import android.os.Handler
 import android.os.Looper
 import android.telecom.Call
 import android.telecom.CallAudioState
+import android.telecom.DisconnectCause
 import android.telecom.InCallService
 import android.telecom.VideoProfile
 import android.util.Log
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * InCallService implementation that provides programmatic call control.
@@ -22,6 +24,10 @@ import android.util.Log
  *
  * Other components access calls through the companion object's static methods.
  * This works because the service and GatewayService run in the same process.
+ *
+ * Thread safety: activeCalls and listeners use CopyOnWriteArrayList because
+ * InCallService callbacks fire on the main thread, but GatewayService calls
+ * control methods from OkHttp's background reader thread.
  */
 class RingInCallService : InCallService() {
 
@@ -31,11 +37,15 @@ class RingInCallService : InCallService() {
         private const val INCOMING_NOTIFICATION_ID = 2
         private const val DTMF_TONE_DURATION_MS = 150L
 
-        private val activeCalls = mutableListOf<Call>()
-        private val listeners = mutableListOf<CallControlListener>()
+        private val activeCalls = CopyOnWriteArrayList<Call>()
+        private val listeners = CopyOnWriteArrayList<CallControlListener>()
         private val mainHandler = Handler(Looper.getMainLooper())
+        private val pendingDtmfRunnables = mutableListOf<Runnable>()
 
-        var lastDisconnectCause: android.telecom.DisconnectCause? = null
+        var lastDisconnectCause: DisconnectCause? = null
+            private set
+
+        var lastCallDurationMs: Long = 0L
             private set
 
         val calls: List<Call> get() = activeCalls.toList()
@@ -91,7 +101,8 @@ class RingInCallService : InCallService() {
 
         /**
          * Send a single DTMF digit. The tone is played for DTMF_TONE_DURATION_MS
-         * then stopped automatically.
+         * then stopped automatically. Guards against call disconnection between
+         * play and stop.
          */
         fun sendDtmf(digit: Char): Boolean {
             val call = activeCall ?: return false
@@ -100,32 +111,55 @@ class RingInCallService : InCallService() {
                 return false
             }
             call.playDtmfTone(digit)
-            mainHandler.postDelayed({ call.stopDtmfTone() }, DTMF_TONE_DURATION_MS)
+            val stopRunnable = Runnable {
+                if (call in activeCalls) {
+                    call.stopDtmfTone()
+                }
+            }
+            synchronized(pendingDtmfRunnables) { pendingDtmfRunnables.add(stopRunnable) }
+            mainHandler.postDelayed(stopRunnable, DTMF_TONE_DURATION_MS)
             return true
         }
 
         /**
          * Send a sequence of DTMF digits with proper inter-digit timing.
-         * Each digit is played for DTMF_TONE_DURATION_MS with a 100ms gap between digits.
+         * Each digit is played for DTMF_TONE_DURATION_MS with a 100ms gap.
+         * Uses a valid-digit counter so skipped invalid chars don't create gaps.
          */
         fun sendDtmfSequence(digits: String): Boolean {
             val call = activeCall ?: return false
             val interDigitDelay = DTMF_TONE_DURATION_MS + 100L
+            var validIndex = 0
 
-            digits.forEachIndexed { index, digit ->
+            for (digit in digits) {
                 if (digit !in "0123456789*#ABCD") {
                     Log.w(TAG, "Skipping invalid DTMF digit: $digit")
-                    return@forEachIndexed
+                    continue
                 }
-                val startDelay = index * interDigitDelay
-                mainHandler.postDelayed({ call.playDtmfTone(digit) }, startDelay)
-                mainHandler.postDelayed({ call.stopDtmfTone() }, startDelay + DTMF_TONE_DURATION_MS)
+                val startDelay = validIndex * interDigitDelay
+                val playRunnable = Runnable {
+                    if (call in activeCalls) {
+                        call.playDtmfTone(digit)
+                    }
+                }
+                val stopRunnable = Runnable {
+                    if (call in activeCalls) {
+                        call.stopDtmfTone()
+                    }
+                }
+                synchronized(pendingDtmfRunnables) {
+                    pendingDtmfRunnables.add(playRunnable)
+                    pendingDtmfRunnables.add(stopRunnable)
+                }
+                mainHandler.postDelayed(playRunnable, startDelay)
+                mainHandler.postDelayed(stopRunnable, startDelay + DTMF_TONE_DURATION_MS)
+                validIndex++
             }
-            return true
+            return validIndex > 0
         }
 
         fun getCallDurationMs(): Long {
-            val call = activeCall ?: return 0L
+            val call = activeCall ?: return lastCallDurationMs
             val connectTime = call.details.connectTimeMillis
             if (connectTime <= 0) return 0L
             return System.currentTimeMillis() - connectTime
@@ -151,11 +185,20 @@ class RingInCallService : InCallService() {
                 else -> "UNKNOWN"
             }
         }
+
+        private fun cancelPendingDtmfRunnables() {
+            synchronized(pendingDtmfRunnables) {
+                for (runnable in pendingDtmfRunnables) {
+                    mainHandler.removeCallbacks(runnable)
+                }
+                pendingDtmfRunnables.clear()
+            }
+        }
     }
 
     interface CallControlListener {
         fun onCallAdded(call: Call)
-        fun onCallRemoved(call: Call, disconnectCause: android.telecom.DisconnectCause?)
+        fun onCallRemoved(call: Call, disconnectCause: DisconnectCause?, durationMs: Long)
         fun onCallStateChanged(call: Call, state: Int)
     }
 
@@ -174,7 +217,9 @@ class RingInCallService : InCallService() {
         val callback = object : Call.Callback() {
             override fun onStateChanged(call: Call, state: Int) {
                 Log.d(TAG, "Call state changed: $state")
-                listeners.toList().forEach { it.onCallStateChanged(call, state) }
+                for (listener in listeners) {
+                    listener.onCallStateChanged(call, state)
+                }
             }
         }
         callCallbacks[call] = callback
@@ -185,19 +230,34 @@ class RingInCallService : InCallService() {
         }
         launchInCallActivity(call)
 
-        listeners.toList().forEach { it.onCallAdded(call) }
+        for (listener in listeners) {
+            listener.onCallAdded(call)
+        }
     }
 
     override fun onCallRemoved(call: Call) {
         Log.d(TAG, "Call removed")
+
+        // Capture duration BEFORE removing call from activeCalls
+        val connectTime = call.details.connectTimeMillis
+        val durationMs = if (connectTime > 0) {
+            System.currentTimeMillis() - connectTime
+        } else {
+            0L
+        }
+        lastCallDurationMs = durationMs
+
         val disconnectCause = call.details.disconnectCause
         lastDisconnectCause = disconnectCause
 
+        cancelPendingDtmfRunnables()
         callCallbacks.remove(call)?.let { call.unregisterCallback(it) }
         activeCalls.remove(call)
         cancelIncomingCallNotification()
 
-        listeners.toList().forEach { it.onCallRemoved(call, disconnectCause) }
+        for (listener in listeners) {
+            listener.onCallRemoved(call, disconnectCause, durationMs)
+        }
     }
 
     override fun onCallAudioStateChanged(audioState: CallAudioState?) {

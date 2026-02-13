@@ -113,7 +113,7 @@ class InCallActivity : AppCompatActivity(), RingInCallService.CallControlListene
         runOnUiThread { updateUiFromCallState() }
     }
 
-    override fun onCallRemoved(call: Call, disconnectCause: DisconnectCause?) {
+    override fun onCallRemoved(call: Call, disconnectCause: DisconnectCause?, durationMs: Long) {
         runOnUiThread {
             stopTimer()
             val causeLabel = disconnectCause?.label?.toString() ?: "Ended"
